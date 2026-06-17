@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: primesrc-pipeline
+    runtime: python
+    region: oregon
+
+    # Install Chromium system package before pip deps
+    buildCommand: |
+      apt-get update -qq && \
+      apt-get install -y -qq \
+        chromium \
+        chromium-driver \
+        fonts-liberation \
+        libnss3 \
+        libatk-bridge2.0-0 \
+        libdrm2 \
+        libxkbcommon0 \
+        libgbm1 \
+        libasound2 \
+      && pip install --upgrade pip \
+      && pip install -r requirements.txt
+
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+
+    envVars:
+      - key: PIPELINE_SECRET
+        sync: false          # set manually in Render dashboard
+      - key: TMDB_API_KEY
+        sync: false          # optional
+
+    # Free tier — note: instance spins down after inactivity
+    plan: free
