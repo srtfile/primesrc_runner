@@ -1,0 +1,185 @@
+name: PrimeSrc Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      media_type:
+        description: "Movie or TV"
+        required: false
+        default: "movie"
+        type: choice
+        options: [movie, tv]
+      skip_stage1:
+        description: "Skip Stage 1 (use existing api keys)"
+        required: false
+        default: false
+        type: boolean
+      skip_stage2:
+        description: "Skip Stage 2 (keys only, no browser)"
+        required: false
+        default: false
+        type: boolean
+      batch_size:
+        description: "Concurrent tabs in Stage 2"
+        required: false
+        default: "5"
+
+  push:
+    branches: [main]
+    paths:
+      - "multiple_primesrc.txt"   # auto-trigger when input list changes
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    permissions:
+      contents: write
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 2. Resolve inputs (workflow_dispatch vs push) ──────────
+      - name: Resolve inputs
+        id: cfg
+        run: |
+          echo "media_type=${{ github.event.inputs.media_type || 'movie' }}"       >> $GITHUB_OUTPUT
+          echo "skip_stage1=${{ github.event.inputs.skip_stage1 || 'false' }}"     >> $GITHUB_OUTPUT
+          echo "skip_stage2=${{ github.event.inputs.skip_stage2 || 'false' }}"     >> $GITHUB_OUTPUT
+          echo "batch_size=${{ github.event.inputs.batch_size || '5' }}"           >> $GITHUB_OUTPUT
+
+      # ── 3. Trigger Render pipeline ─────────────────────────────
+      - name: Trigger pipeline on Render
+        id: trigger
+        run: |
+          # Read embed URLs from file and pass inline so Render doesn't
+          # need its own copy of the repo
+          EMBED_URLS=$(python3 - << 'EOF'
+          import json, pathlib
+          lines = [l.strip() for l in pathlib.Path("multiple_primesrc.txt").read_text().splitlines()
+                   if l.strip() and not l.startswith("#")]
+          print(json.dumps(lines))
+          EOF
+          )
+
+          PAYLOAD=$(python3 - << EOF
+          import json, sys
+          payload = {
+              "media_type":  "${{ steps.cfg.outputs.media_type }}",
+              "skip_stage1": ${{ steps.cfg.outputs.skip_stage1 == 'true' && 'true' || 'false' }},
+              "skip_stage2": ${{ steps.cfg.outputs.skip_stage2 == 'true' && 'true' || 'false' }},
+              "batch_size":  int("${{ steps.cfg.outputs.batch_size }}"),
+              "embed_urls":  $EMBED_URLS,
+          }
+          print(json.dumps(payload))
+          EOF
+          )
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "${{ secrets.RENDER_APP_URL }}/run" \
+            -H "Content-Type: application/json" \
+            -H "X-Secret: ${{ secrets.PIPELINE_SECRET }}" \
+            -d "$PAYLOAD")
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Failed to trigger pipeline (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+          echo "Pipeline triggered (HTTP $HTTP_CODE)"
+
+      # ── 4. Poll until done ─────────────────────────────────────
+      - name: Wait for pipeline to finish
+        id: poll
+        run: |
+          MAX_WAIT=5400   # 90 min
+          INTERVAL=15
+          ELAPSED=0
+
+          while true; do
+            STATUS_JSON=$(curl -s \
+              -H "X-Secret: ${{ secrets.PIPELINE_SECRET }}" \
+              "${{ secrets.RENDER_APP_URL }}/status")
+
+            LAST_STATUS=$(echo "$STATUS_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['last_status'])")
+            RUNNING=$(echo "$STATUS_JSON"     | python3 -c "import sys,json; print(json.load(sys.stdin)['running'])")
+
+            echo "[$ELAPSED s] status=$LAST_STATUS  running=$RUNNING"
+
+            if [ "$RUNNING" = "False" ] && [ "$LAST_STATUS" != "idle" ] && [ "$LAST_STATUS" != "running" ]; then
+              echo "pipeline_status=$LAST_STATUS" >> $GITHUB_OUTPUT
+              break
+            fi
+
+            if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
+              echo "Timed out waiting for pipeline"
+              echo "pipeline_status=timeout" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+      # ── 5. Download output files ───────────────────────────────
+      - name: Download results from Render
+        if: steps.poll.outputs.pipeline_status == 'success'
+        run: |
+          for FILE in api_url_list.txt final_stream_urls.txt pipeline_summary.json pipeline_summary.gz.json; do
+            HTTP_CODE=$(curl -s -w "%{http_code}" \
+              -H "X-Secret: ${{ secrets.PIPELINE_SECRET }}" \
+              "${{ secrets.RENDER_APP_URL }}/results/$FILE" \
+              -o "$FILE")
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Downloaded $FILE"
+            else
+              echo "Warning: $FILE not available (HTTP $HTTP_CODE)"
+            fi
+          done
+
+      # ── 6. Fail if pipeline errored ────────────────────────────
+      - name: Check pipeline result
+        if: steps.poll.outputs.pipeline_status != 'success'
+        run: |
+          echo "Pipeline finished with status: ${{ steps.poll.outputs.pipeline_status }}"
+          exit 1
+
+      # ── 7. Commit results back to repo ─────────────────────────
+      - name: Commit results
+        if: steps.poll.outputs.pipeline_status == 'success'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            api_url_list.txt \
+            final_stream_urls.txt \
+            pipeline_summary.json \
+            pipeline_summary.gz.json \
+            || true
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: pipeline run $(date -u '+%Y-%m-%dT%H:%M:%SZ') [skip ci]"
+            git push
+          fi
+
+      # ── 8. Upload artifacts ────────────────────────────────────
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-outputs-${{ github.run_number }}
+          path: |
+            api_url_list.txt
+            final_stream_urls.txt
+            pipeline_summary.json
+            pipeline_summary.gz.json
+          retention-days: 30
+          if-no-files-found: warn
